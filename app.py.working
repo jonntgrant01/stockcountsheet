@@ -1,0 +1,855 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import base64
+import csv
+import io
+from datetime import datetime
+
+# Set page title and configuration
+st.set_page_config(
+    page_title="Arc Inspirations - Stock Count",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Initialize session state variables if they don't exist
+if 'stock_data' not in st.session_state:
+    st.session_state.stock_data = None
+if 'count_data' not in st.session_state:
+    st.session_state.count_data = {}
+if 'current_search' not in st.session_state:
+    st.session_state.current_search = ""
+if 'filtered_data' not in st.session_state:
+    st.session_state.filtered_data = None
+if 'sc_closed' not in st.session_state:
+    st.session_state.sc_closed = {}
+if 'accessibility_mode' not in st.session_state:
+    st.session_state.accessibility_mode = False
+if 'view' not in st.session_state:
+    st.session_state.view = "splash"  # "splash" or "main"
+
+# Function to create custom html components with ARIA attributes
+def accessible_html(tag, content, **kwargs):
+    attrs = " ".join([f'{k}="{v}"' for k, v in kwargs.items()])
+    return f"<{tag} {attrs}>{content}</{tag}>"
+
+# Function to get contrast-friendly colors based on accessibility mode
+def get_theme_color(color_name):
+    if st.session_state.accessibility_mode:
+        # High contrast colors
+        colors = {
+            'primary': '#FFFFFF',       # White
+            'secondary': '#000000',     # Black
+            'background': '#000000',    # Black
+            'text': '#FFFFFF',          # White
+            'accent': '#FFFF00',        # Yellow
+            'warning': '#FFFF00',       # Yellow
+            'success': '#00FF00',       # Bright Green
+            'error': '#FF0000',         # Bright Red
+        }
+    else:
+        # Regular theme colors
+        colors = {
+            'primary': '#FF4B8B',       # Pink
+            'secondary': '#4A154B',     # Purple
+            'background': '#FFFFFF',    # White
+            'text': '#4A154B',          # Purple
+            'accent': '#F9EAFF',        # Light Purple
+            'warning': '#FFA500',       # Orange
+            'success': '#00CC66',       # Green
+            'error': '#FF3333',         # Red
+        }
+    return colors.get(color_name, colors['primary'])
+
+# Function to validate CSV structure and map columns
+def validate_csv(df):
+    # Print CSV columns to debug
+    st.write("CSV Columns:", list(df.columns))
+    
+    # Define column mappings (to handle different possible column names)
+    possible_id_columns = ['product_id', 'id', 'item_id', 'sku', 'item_number', 'item#', 'product#', 'barcode', 'code', 'item code', 'product code', 'article number']
+    possible_brand_columns = ['brand', 'Brand', 'manufacturer', 'supplier', 'vendor', 'make', 'producer', 'company', 'label', 'maker', 'source', 'Brand and Description']
+    possible_description_columns = ['description', 'Description', 'product_description', 'item_description', 'details', 'specs', 'product_name', 'name', 'title', 'item', 'product', 'desc', 'article', 'goods', 'merchandise', 'Brand and Description']
+    possible_location_columns = ['location', 'location_id', 'loc', 'warehouse', 'shelf', 'bin', 'storage', 'position', 'area', 'zone', 'aisle', 'section', 'dept', 'department', 'store']
+    possible_count_columns = ['expected_count', 'count', 'quantity', 'qty', 'stock', 'inventory', 'on_hand', 'amount', 'units', 'expected', 'expected qty', 'on hand qty', 'stock level', 'current stock', 'stock count', 'current count', '[E]Close SC']
+    
+    # Try exact match first
+    id_col = next((col for col in df.columns if col.lower() in [c.lower() for c in possible_id_columns]), None)
+    brand_col = next((col for col in df.columns if col.lower() in [c.lower() for c in possible_brand_columns]), None)
+    description_col = next((col for col in df.columns if col.lower() in [c.lower() for c in possible_description_columns]), None)
+    location_col = next((col for col in df.columns if col.lower() in [c.lower() for c in possible_location_columns]), None)
+    count_col = next((col for col in df.columns if col.lower() in [c.lower() for c in possible_count_columns]), None)
+    
+    # If not found, try partial match as a fallback
+    if description_col is None:
+        for col in df.columns:
+            if any(term in col.lower() for term in ['desc', 'name', 'product', 'item', 'title', 'article']):
+                description_col = col
+                break
+    
+    if count_col is None:
+        for col in df.columns:
+            if any(term in col.lower() for term in ['count', 'qty', 'quant', 'stock', 'amount', 'unit', 'invent']):
+                count_col = col
+                break
+    
+    # Check if we have product_name or description - we can work with either
+    has_product_name = False
+    if 'product_name' in df.columns and description_col is None:
+        description_col = 'product_name'
+        has_product_name = True
+
+    # Handle missing brand by using a default value
+    if brand_col is None and description_col is not None:
+        df['brand'] = "Unknown"
+        brand_col = 'brand'
+    
+    # Check if we have sufficient columns to work with
+    missing_types = []
+    if id_col is None:
+        # If no ID column, we'll create one using row numbers
+        df['product_id'] = [f"P{i+1:03d}" for i in range(len(df))]
+        id_col = 'product_id'
+    
+    # Description is required - we can't reasonably create this
+    if description_col is None:
+        missing_types.append("description or product name")
+    
+    # Location is optional, we can use "Unknown" as default
+    if location_col is None:
+        df['location'] = "Unknown"
+        location_col = 'location'
+    
+    # Expected count is required
+    if count_col is None:
+        missing_types.append("expected count or quantity")
+    
+    if missing_types:
+        return False, f"Required column types missing: {', '.join(missing_types)}. At minimum, please include columns for description/name and expected count."
+    
+    # Map the found columns to our expected column names
+    df_mapped = df.copy()
+    rename_dict = {
+        id_col: 'product_id',
+        location_col: 'location',
+        count_col: 'expected_count'
+    }
+    
+    if not has_product_name:
+        rename_dict[description_col] = 'description'
+        if brand_col != 'brand':  # Don't remap if we created it above
+            rename_dict[brand_col] = 'brand'
+    else:
+        # If we're using product_name as description, no need to rename
+        df_mapped['description'] = df_mapped[description_col]
+        
+    df_mapped.rename(columns=rename_dict, inplace=True)
+    
+    # Create product_name field by combining brand and description if needed
+    if 'product_name' not in df_mapped.columns:
+        df_mapped['product_name'] = df_mapped['brand'] + ' - ' + df_mapped['description']
+    
+    # Check data types
+    try:
+        # Convert expected_count to numeric
+        df_mapped['expected_count'] = pd.to_numeric(df_mapped['expected_count'])
+        
+        # Ensure product_id is unique
+        if df_mapped['product_id'].duplicated().any():
+            return False, "Duplicate product IDs found. Each product ID must be unique."
+        
+        return True, df_mapped
+    except Exception as e:
+        return False, f"Error validating data: {str(e)}"
+
+# Function to add a count entry
+def add_count_entry(product_id, count_value, count_location, count_note):
+    if product_id not in st.session_state.count_data:
+        st.session_state.count_data[product_id] = []
+    
+    # Add timestamp to each count entry
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    st.session_state.count_data[product_id].append({
+        'count': count_value,
+        'location': count_location,
+        'note': count_note,
+        'timestamp': timestamp
+    })
+
+# Function to download data as CSV
+def get_csv_download_link(df, filename="stock_count_results.csv"):
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download CSV File</a>'
+    return href
+
+# Function to prepare final data for export
+def prepare_export_data():
+    if st.session_state.stock_data is None:
+        st.error("No stock data available for export.")
+        return None
+    
+    # Create a copy of the original stock data
+    export_df = st.session_state.stock_data.copy()
+    
+    # Add columns for count data
+    export_df['total_counted'] = 0
+    export_df['count_locations'] = ''
+    export_df['count_notes'] = ''
+    export_df['last_counted'] = ''
+    export_df['[E]Close SC'] = 'No'  # Column for SC closed status
+    
+    # Fill in the count data
+    for product_id, counts in st.session_state.count_data.items():
+        if product_id in export_df['product_id'].values:
+            row_idx = export_df.index[export_df['product_id'] == product_id].tolist()[0]
+            
+            total_count = sum(entry['count'] for entry in counts)
+            export_df.at[row_idx, 'total_counted'] = total_count
+            
+            locations = ", ".join(set(entry['location'] for entry in counts))
+            export_df.at[row_idx, 'count_locations'] = locations
+            
+            notes = "; ".join(filter(None, [entry['note'] for entry in counts]))
+            export_df.at[row_idx, 'count_notes'] = notes
+            
+            # Get the latest timestamp
+            if counts:
+                latest_time = max(entry['timestamp'] for entry in counts)
+                export_df.at[row_idx, 'last_counted'] = latest_time
+            
+            # Set [E]Close SC status
+            if product_id in st.session_state.sc_closed:
+                export_df.at[row_idx, '[E]Close SC'] = 'Yes' if st.session_state.sc_closed[product_id] else 'No'
+    
+    # Calculate variance
+    export_df['variance'] = export_df['total_counted'] - export_df['expected_count']
+    
+    return export_df
+
+# Function to switch from splash screen to main application
+def switch_to_main():
+    st.session_state.view = "main"
+    st.rerun()
+
+# Apply global centering CSS for all text content
+st.markdown("""
+<style>
+.stApp {
+    text-align: center;
+}
+.stTextInput, .stNumberInput, .stSelectbox, .stTextArea {
+    text-align: center;
+    margin-left: auto;
+    margin-right: auto;
+    max-width: 600px;
+}
+div.row-widget.stButton {
+    text-align: center;
+    display: flex;
+    justify-content: center;
+}
+.css-6qob1r {
+    text-align: center !important;
+}
+.css-10trblm {
+    text-align: center !important;
+}
+p, h1, h2, h3, h4, h5, h6 {
+    text-align: center !important;
+}
+.stMarkdown {
+    text-align: center !important;
+}
+/* Dropdown style changes */
+.stSelectbox > div > div {
+    background-color: white !important;
+    color: black !important;
+}
+/* Dropdown options */
+.stSelectbox ul {
+    background-color: white !important;
+}
+.stSelectbox ul li {
+    color: black !important;
+}
+/* Dropdown arrow */
+.stSelectbox svg {
+    color: black !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Check which view to display (splash screen or main app)
+if st.session_state.view == "splash":
+    # ===== SPLASH SCREEN =====
+    # Display in center of page with large logo and minimal UI
+    st.markdown("<div style='padding: 5% 0;'></div>", unsafe_allow_html=True)  # Top spacing
+    
+    # Center-aligned container
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        # Logo at the top (centered and larger)
+        try:
+            # Use the actual logo image
+            logo_path = "assets/company_logo.png"
+            
+            # Add ARIA label for screen readers with center alignment
+            st.markdown(
+                f'<div role="img" aria-label="Arc Inspirations Logo" style="display: flex; justify-content: center;">', 
+                unsafe_allow_html=True
+            )
+            
+            # Apply high contrast filter if in accessibility mode
+            if st.session_state.accessibility_mode:
+                st.markdown("""
+                <style>
+                .high-contrast-img {
+                    filter: contrast(200%) brightness(150%) invert(100%);
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="display: flex; justify-content: center;"><img src="data:image/png;base64,{base64.b64encode(open(logo_path, "rb").read()).decode()}" width="400" class="high-contrast-img"></div>', 
+                    unsafe_allow_html=True
+                )
+            else:
+                st.image(logo_path, width=400)  # Larger logo on splash screen
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+        except:
+            # If no logo is found, show a text header with appropriate contrast
+            if st.session_state.accessibility_mode:
+                st.markdown(f'<h1 style="color:{get_theme_color("text")}; text-align: center; font-size: 3rem;">Arc Inspirations</h1>', unsafe_allow_html=True)
+            else:
+                st.markdown('<h1 style="text-align: center; font-size: 3rem;">Arc Inspirations</h1>', unsafe_allow_html=True)
+        
+        # Main application header (centered)
+        st.markdown("<h1 style='text-align: center; margin-top: 2rem;'>📦 Stock Count</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; font-size: 1.2rem; margin-bottom: 3rem;'>Upload your stock list to begin counting</p>", unsafe_allow_html=True)
+        
+        # File uploader
+        uploaded_file = st.file_uploader("Upload Stock CSV File", type=["csv"], key="splash_uploader")
+        
+        if uploaded_file is not None:
+            # Add a spinner while processing
+            with st.spinner("Processing your file..."):
+                try:
+                    # Process the uploaded file (same logic as in sidebar)
+                    df = pd.read_csv(uploaded_file, header=1)  # Default to header on row 2
+                    
+                    # Try automatic validation
+                    valid, result = validate_csv(df)
+                    
+                    if valid:
+                        st.session_state.stock_data = result
+                        # Success message and switch to main app
+                        st.success("✅ Stock data successfully loaded!")
+                        st.session_state.view = "main"
+                        st.rerun()
+                    else:
+                        # If validation fails, switch to main app with the manual mapping interface
+                        st.session_state.temp_df = df
+                        st.session_state.manual_mapping = True
+                        st.session_state.view = "main"  # Switch to main view for detailed mapping
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+        
+        # Options below the file uploader
+        st.markdown("<p style='text-align: center; margin-top: 3rem;'>Advanced Options</p>", unsafe_allow_html=True)
+        
+        # Two columns for the buttons
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if st.button("CSV Templates"):
+                st.session_state.view = "main"  # Go to main app but in template mode
+                st.rerun()
+                
+        with bc2:
+            if st.button("Continue to App"):
+                st.session_state.view = "main"
+                st.rerun()
+        
+        # Accessibility toggle at bottom
+        st.markdown("<div style='padding: 10% 0;'></div>", unsafe_allow_html=True)  # Spacing
+        accessibility_enabled = st.checkbox(
+            "Enable Accessibility Mode",
+            value=st.session_state.accessibility_mode,
+            help="Activates high-contrast mode and enhanced screen reader support"
+        )
+        
+        # Update accessibility mode in session state if changed
+        if accessibility_enabled != st.session_state.accessibility_mode:
+            st.session_state.accessibility_mode = accessibility_enabled
+            st.rerun()
+
+else:
+    # Apply global centering CSS for all text content
+    st.markdown("""
+    <style>
+    .stApp {
+        text-align: center;
+    }
+    .stTextInput, .stNumberInput, .stSelectbox, .stTextArea {
+        text-align: center;
+        margin-left: auto;
+        margin-right: auto;
+        max-width: 600px;
+    }
+    div.row-widget.stButton {
+        text-align: center;
+        display: flex;
+        justify-content: center;
+    }
+    /* Dropdown style changes */
+    .stSelectbox > div > div {
+        background-color: white !important;
+        color: black !important;
+    }
+    /* Dropdown options */
+    .stSelectbox ul {
+        background-color: white !important;
+    }
+    .stSelectbox ul li {
+        color: black !important;
+    }
+    /* Dropdown arrow */
+    .stSelectbox svg {
+        color: black !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ===== MAIN APPLICATION =====
+    # Add company logo at the top (centered) - before title
+    try:
+        # Use the actual logo image
+        logo_path = "assets/company_logo.png"
+        
+        # Add ARIA label for screen readers with center alignment
+        st.markdown(
+            f'<div role="img" aria-label="Arc Inspirations Logo" style="display: flex; justify-content: center;">', 
+            unsafe_allow_html=True
+        )
+        
+        # Apply high contrast filter if in accessibility mode
+        if st.session_state.accessibility_mode:
+            st.markdown("""
+            <style>
+            .high-contrast-img {
+                filter: contrast(200%) brightness(150%) invert(100%);
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="display: flex; justify-content: center;"><img src="data:image/png;base64,{base64.b64encode(open(logo_path, "rb").read()).decode()}" width="300" class="high-contrast-img"></div>', 
+                unsafe_allow_html=True
+            )
+        else:
+            st.image(logo_path, width=300)  # Smaller logo on main app
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    except:
+        # If no logo is found, show a text header with appropriate contrast
+        if st.session_state.accessibility_mode:
+            st.markdown(f'<h1 style="color:{get_theme_color("text")}; text-align: center;">Arc Inspirations</h1>', unsafe_allow_html=True)
+        else:
+            st.markdown('<h1 style="text-align: center;">Arc Inspirations</h1>', unsafe_allow_html=True)
+
+    # Main application header (centered) - now below logo
+    st.markdown("<h1 style='text-align: center;'>📦 Stock Count</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Upload your stock list, search for products, and record stock counts.</p>", unsafe_allow_html=True)
+
+    # Sidebar for file upload and export
+    with st.sidebar:
+        st.header("Data Management")
+        
+        # File Upload
+        uploaded_file = st.file_uploader("Upload Stock CSV File", type=["csv"])
+        
+        # CSV import options
+        with st.expander("CSV Import Options"):
+            header_row = st.number_input("Header row number (1 for first row, 2 for second row, etc.)", 
+                                         min_value=1, max_value=10, value=2)
+            st.info("If your column names are on the second line of the CSV, use 2.")
+        
+        if uploaded_file is not None:
+            try:
+                # Read CSV with specified header row (adjusting for 0-based indexing)
+                df = pd.read_csv(uploaded_file, header=header_row-1)
+                
+                # Show the column mapping interface if auto-detection fails
+                if 'manual_mapping' not in st.session_state:
+                    st.session_state.manual_mapping = False
+                    st.session_state.temp_df = None
+                
+                # Try automatic validation first
+                valid, result = validate_csv(df)
+                
+                if valid:
+                    st.session_state.stock_data = result
+                    st.session_state.manual_mapping = False
+                    st.success("✅ Stock data successfully loaded!")
+                else:
+                    # If automatic validation fails, show manual mapping interface
+                    st.error(f"❌ Error: {result}")
+                    st.session_state.temp_df = df
+                    st.session_state.manual_mapping = True
+                    
+                    st.subheader("Manual Column Mapping")
+                    st.write("Please map your CSV columns to the required fields:")
+                    
+                    # Show available columns
+                    st.write("Your CSV contains these columns:", list(df.columns))
+                    
+                    # Column selectors
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        description_col = st.selectbox(
+                            "Select the column containing product descriptions:",
+                            options=["--Select--"] + list(df.columns),
+                            key="description_select"
+                        )
+                        
+                        brand_col = st.selectbox(
+                            "Select the column containing brand information (optional):",
+                            options=["--None--"] + list(df.columns),
+                            key="brand_select"
+                        )
+                        
+                        location_col = st.selectbox(
+                            "Select the column containing location (optional):",
+                            options=["--None--"] + list(df.columns),
+                            key="location_select"
+                        )
+                    
+                    with col2:
+                        count_col = st.selectbox(
+                            "Select the column containing quantity/count:",
+                            options=["--Select--"] + list(df.columns),
+                            key="count_select"
+                        )
+                        
+                        id_col = st.selectbox(
+                            "Select the column containing product IDs (optional):",
+                            options=["--None--"] + list(df.columns),
+                            key="id_select"
+                        )
+                    
+                    if st.button("Apply Mapping"):
+                        # Check if required columns are selected
+                        if description_col == "--Select--" or count_col == "--Select--":
+                            st.error("You must select columns for description and count!")
+                        else:
+                            # Create a mapped dataframe
+                            df_mapped = df.copy()
+                            
+                            # Add required columns if they don't exist
+                            if id_col == "--None--":
+                                df_mapped['product_id'] = [f"P{i+1:03d}" for i in range(len(df))]
+                            else:
+                                df_mapped.rename(columns={id_col: 'product_id'}, inplace=True)
+                            
+                            # Map description
+                            df_mapped.rename(columns={description_col: 'description'}, inplace=True)
+                            
+                            # Map brand (or use "Unknown")
+                            if brand_col == "--None--":
+                                df_mapped['brand'] = "Unknown"
+                            else:
+                                df_mapped.rename(columns={brand_col: 'brand'}, inplace=True)
+                            
+                            # Map location (or use "Unknown")
+                            if location_col == "--None--":
+                                df_mapped['location'] = "Unknown"
+                            else:
+                                df_mapped.rename(columns={location_col: 'location'}, inplace=True)
+                            
+                            # Map count
+                            df_mapped.rename(columns={count_col: 'expected_count'}, inplace=True)
+                            
+                            # Ensure product_id is unique
+                            duplicate_ids = False
+                            if df_mapped['product_id'].duplicated().any():
+                                st.error("Duplicate product IDs found. Each product ID must be unique.")
+                                duplicate_ids = True
+                            
+                            # Convert expected_count to numeric
+                            numeric_error = False
+                            try:
+                                df_mapped['expected_count'] = pd.to_numeric(df_mapped['expected_count'])
+                            except Exception as e:
+                                st.error(f"Error converting count to numeric values: {str(e)}")
+                                numeric_error = True
+                            
+                            # Only proceed if no errors
+                            if not duplicate_ids and not numeric_error:
+                                # Create product_name field
+                                df_mapped['product_name'] = df_mapped['brand'] + ' - ' + df_mapped['description']
+                                
+                                # Save the mapped data
+                                st.session_state.stock_data = df_mapped
+                                st.session_state.manual_mapping = False
+                                st.success("✅ Stock data successfully loaded with your mapping!")
+                                st.rerun()
+                
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+        
+        # Export data
+        st.header("Export Count Results")
+        if st.button("Generate Export CSV"):
+            export_data = prepare_export_data()
+            if export_data is not None:
+                st.markdown(get_csv_download_link(export_data), unsafe_allow_html=True)
+                
+        # Hidden expandable section for templates
+        with st.expander("CSV Templates (click to expand)"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("Full Template"):
+                    sample_data = {
+                        'product_id': ['P001', 'P002', 'P003'],
+                        'brand': ['Brand A', 'Brand B', 'Brand C'],
+                        'description': ['Widget Small', 'Widget Medium', 'Widget Large'],
+                        'location': ['Shelf A1', 'Shelf B2', 'Shelf C3'],
+                        'expected_count': [100, 50, 75]
+                    }
+                    sample_df = pd.DataFrame(sample_data)
+                    st.markdown(get_csv_download_link(sample_df, "full_template.csv"), unsafe_allow_html=True)
+            
+            with col2:
+                if st.button("Minimal Template"):
+                    sample_data = {
+                        'description': ['Red T-shirt Small', 'Blue Jeans 32W', 'Black Sneakers Size 10'],
+                        'qty': [50, 75, 25]
+                    }
+                    sample_df = pd.DataFrame(sample_data)
+                    st.markdown(get_csv_download_link(sample_df, "minimal_template.csv"), unsafe_allow_html=True)
+                
+        # Accessibility toggle at bottom of sidebar
+        st.markdown("---")
+        st.header("Accessibility Options")
+        accessibility_enabled = st.checkbox(
+            "Enable Accessibility Mode",
+            value=st.session_state.accessibility_mode,
+            help="Activates high-contrast mode and enhanced screen reader support"
+        )
+        
+        # Update accessibility mode in session state if changed
+        if accessibility_enabled != st.session_state.accessibility_mode:
+            st.session_state.accessibility_mode = accessibility_enabled
+            st.rerun()
+    
+    # Main content area - Only show if not in splash screen
+    if st.session_state.stock_data is not None:
+        # Search bar
+        st.subheader("Search Products")
+        search_query = st.text_input("Enter Brand and Description", st.session_state.current_search)
+        
+        if search_query != st.session_state.current_search:
+            st.session_state.current_search = search_query
+            st.rerun()
+        
+        # Don't display any product options until user enters a search
+        if not search_query:
+            st.session_state.filtered_data = pd.DataFrame()  # Empty dataframe when no search
+            st.markdown("**Enter search terms above to find products**")
+            st.markdown("*Search by brand name, product description, or product ID*")
+        # Filter data based on search when user has typed something
+        else:
+            filtered = st.session_state.stock_data[
+                st.session_state.stock_data['product_id'].str.contains(search_query, case=False) | 
+                st.session_state.stock_data['brand'].str.contains(search_query, case=False) | 
+                st.session_state.stock_data['description'].str.contains(search_query, case=False) |
+                st.session_state.stock_data['product_name'].str.contains(search_query, case=False)
+            ]
+            st.session_state.filtered_data = filtered
+            
+            # Show number of results found with accessibility improvements
+            if st.session_state.accessibility_mode:
+                st.markdown(accessible_html(
+                    "div", 
+                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>" +
+                    f"{len(st.session_state.filtered_data)} products found</strong>",
+                    role="status",
+                    aria_live="polite",
+                    aria_label=f"{len(st.session_state.filtered_data)} products found in your search"
+                ), unsafe_allow_html=True)
+            else:
+                st.markdown(f"**{len(st.session_state.filtered_data)} products found**")
+            
+            # Display products in a list with proper ARIA roles only if we have results
+            if len(st.session_state.filtered_data) > 0:
+                for index, row in st.session_state.filtered_data.iterrows():
+                    product_id = row['product_id']
+                    
+                    # Check if this product has any counts and if it's marked as complete
+                    has_counts = product_id in st.session_state.count_data and len(st.session_state.count_data[product_id]) > 0
+                    sc_closed = product_id in st.session_state.sc_closed and st.session_state.sc_closed[product_id]
+                    
+                    # Create columns for the item row in search results
+                    list_col1, list_col2, list_col3 = st.columns([4, 1, 1])
+                    
+                    # Add count status indicator in second column
+                    with list_col2:
+                        if has_counts:
+                            total_count = sum(entry['count'] for entry in st.session_state.count_data[product_id])
+                            st.markdown(f"**Count: {total_count}**")
+                        else:
+                            st.markdown("**Not counted**")
+                    
+                    # Add complete button in third column
+                    with list_col3:
+                        button_label = "✓ Complete" if sc_closed else "Complete"
+                        button_type = "secondary" if sc_closed else "primary"
+                        
+                        if st.button(button_label, key=f"search_complete_{product_id}", type=button_type, disabled=sc_closed):
+                            st.session_state.sc_closed[product_id] = True
+                            st.success(f"Count for {product_id} marked as complete!")
+                            st.rerun()
+                    
+                    # Main product information column
+                    with list_col1:
+                        with st.expander(f"{row['product_id']} - {row['product_name']} (Expected: {row['expected_count']})"):
+                            col1, col2 = st.columns([1, 1])
+                        
+                        # Product information with accessibility enhancements
+                        with col1:
+                            if st.session_state.accessibility_mode:
+                                # High contrast version with ARIA attributes
+                                st.markdown(accessible_html(
+                                    "div", 
+                                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>Product ID:</strong> " + 
+                                    f"<span style='color:{get_theme_color('text')};'>{row['product_id']}</span>",
+                                    role="text", 
+                                    aria_label=f"Product ID: {row['product_id']}"
+                                ), unsafe_allow_html=True)
+                                
+                                st.markdown(accessible_html(
+                                    "div", 
+                                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>Brand:</strong> " + 
+                                    f"<span style='color:{get_theme_color('text')};'>{row['brand']}</span>",
+                                    role="text", 
+                                    aria_label=f"Brand: {row['brand']}"
+                                ), unsafe_allow_html=True)
+                                
+                                st.markdown(accessible_html(
+                                    "div", 
+                                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>Description:</strong> " + 
+                                    f"<span style='color:{get_theme_color('text')};'>{row['description']}</span>",
+                                    role="text", 
+                                    aria_label=f"Description: {row['description']}"
+                                ), unsafe_allow_html=True)
+                                
+                                st.markdown(accessible_html(
+                                    "div", 
+                                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>Location:</strong> " + 
+                                    f"<span style='color:{get_theme_color('text')};'>{row['location']}</span>",
+                                    role="text", 
+                                    aria_label=f"Location: {row['location']}"
+                                ), unsafe_allow_html=True)
+                                
+                                st.markdown(accessible_html(
+                                    "div", 
+                                    f"<strong style='color:{get_theme_color('text')}; font-size: larger;'>Expected Count:</strong> " + 
+                                    f"<span style='color:{get_theme_color('text')};'>{row['expected_count']}</span>",
+                                    role="text", 
+                                    aria_label=f"Expected Count: {row['expected_count']}"
+                                ), unsafe_allow_html=True)
+                            else:
+                                # Standard version
+                                st.markdown(f"**Product ID:** {row['product_id']}")
+                                st.markdown(f"**Brand:** {row['brand']}")
+                                st.markdown(f"**Description:** {row['description']}")
+                                st.markdown(f"**Location:** {row['location']}")
+                                st.markdown(f"**Expected Count:** {row['expected_count']}")
+                    
+                    # Count entry form
+                    with col2:
+                        st.subheader("Add Count Entry")
+                        count_value = st.number_input("Count", min_value=0.0, step=0.1, format="%.1f", key=f"count_{product_id}")
+                        
+                        # Dropdown for count location with predefined options
+                        location_options = ["Bar 1", "Bar 2", "Store Room 1", "Store Room 2", "Cellar"]
+                        default_index = 0  # Default to first option
+                        
+                        # Try to set default based on product location if it matches one of our options
+                        product_location = row['location']
+                        for i, option in enumerate(location_options):
+                            if option.lower() == product_location.lower():
+                                default_index = i
+                                break
+                        
+                        count_location = st.selectbox(
+                            "Count Location", 
+                            options=location_options,
+                            index=default_index,
+                            key=f"loc_{product_id}"
+                        )
+                        
+                        count_note = st.text_area("Notes", key=f"note_{product_id}", height=100)
+                        
+                        if st.button("Add Count", key=f"btn_{product_id}"):
+                            if count_value >= 0:
+                                add_count_entry(product_id, count_value, count_location, count_note)
+                                st.success("Count entry added successfully!")
+                                st.rerun()
+                            else:
+                                st.error("Count value must be non-negative.")
+                    
+                    # Display existing count entries
+                    st.subheader("Count Entries")
+                    if product_id in st.session_state.count_data and st.session_state.count_data[product_id]:
+                        counts_df = pd.DataFrame(st.session_state.count_data[product_id])
+                        st.dataframe(counts_df)
+                        
+                        # Calculate and show total count
+                        total_count = sum(entry['count'] for entry in st.session_state.count_data[product_id])
+                        variance = total_count - row['expected_count']
+                        
+                        st.metric(
+                            label="Total Counted", 
+                            value=total_count, 
+                            delta=variance,
+                            delta_color="normal"
+                        )
+                        
+                        # Add "Close SC" checkbox
+                        sc_closed = product_id in st.session_state.sc_closed and st.session_state.sc_closed[product_id]
+                        new_sc_closed = st.checkbox("[E]Close SC when count is complete", value=sc_closed, key=f"close_sc_{product_id}")
+                        
+                        # If checkbox state changed from unchecked to checked
+                        if new_sc_closed and not sc_closed:
+                            st.session_state.sc_closed[product_id] = True
+                            st.success("Stock count closed! Returning to main search page...")
+                            # Clear search to return to main page
+                            st.session_state.current_search = ""
+                            st.rerun()
+                        # If checkbox was unchecked
+                        elif not new_sc_closed:
+                            st.session_state.sc_closed[product_id] = False
+                    else:
+                        st.info("No count entries recorded yet.")
+        else:
+            st.session_state.filtered_data = pd.DataFrame()  # Empty dataframe when no search
+            st.markdown("**Enter search terms to find products**")
+    else:
+        # Placeholder when no data is loaded
+        st.info("👈 Please upload a CSV file from the sidebar to begin counting stock.")
+        
+        # Show example of the app functionality
+        st.subheader("How to use this application:")
+        st.markdown("""
+        1. **Upload your stock CSV** using the uploader in the sidebar
+        2. **Search for products** by Brand and Description
+        3. **Add count entries** for each product, with location and notes
+        4. **Export results** as a CSV file when finished
+        """)
