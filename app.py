@@ -1316,56 +1316,57 @@ else:
         # Add some space before the search box
         st.markdown('<div style="margin: 30px 0 20px 0;"></div>', unsafe_allow_html=True)
         
-        # Create custom HTML to match the iOS search bar in the screenshot (without emoji)
+        # Create a search box that exactly matches the screenshot with purple border
+        # Custom CSS for search box with explicit iOS styling
         st.markdown("""
         <style>
-        /* Hide default label */
-        .css-91z34k {
-            display: none;
+        /* Hide default input container styles */
+        .stTextInput > div > div[data-testid="stFormSubmitButton"] { 
+            display: none !important; 
         }
         
-        /* Modify the search input container */
-        div.row-widget.stTextInput {
-            position: relative;
-            padding: 0;
-            margin-bottom: 25px;
+        /* Hide default input border & background */
+        div[data-baseweb="base-input"] {
+            border: none !important;
+            background: transparent !important;
         }
         
-        /* Style the actual input field */
-        div.row-widget.stTextInput > div > div > div > input {
-            height: 42px;
-            background-color: #f6f6f7 !important;
-            border: 1px solid rgba(0,0,0,0.1) !important;
-            border-radius: 10px !important;
-            padding-left: 36px !important;
+        /* Style the input field exactly like iOS */
+        div[data-baseweb="input"] {
+            border-radius: 20px !important;
+            border: 1px solid rgba(159, 121, 242, 0.3) !important;
+            padding: 0 !important; 
+            overflow: hidden !important;
+            background: white !important;
+        }
+        
+        /* Input element styling */
+        .stTextInput input {
+            border: none !important;
+            padding: 10px 10px 10px 40px !important;
+            background-color: transparent !important;
             font-size: 15px !important;
-            color: rgba(0,0,0,0.8) !important;
+            color: #333 !important;
         }
         
-        /* Create magnifying glass icon using a CSS-only approach */
-        div.row-widget.stTextInput::before {
-            content: "";
-            position: absolute;
-            left: 12px;
-            top: 50%;
-            transform: translateY(-60%);
-            width: 12px;
-            height: 12px;
-            border: 2px solid #939395;
-            border-radius: 50%;
-            z-index: 100;
+        /* Input placeholder */
+        .stTextInput input::placeholder {
+            color: #999 !important;
+            font-size: 15px !important;
         }
         
-        div.row-widget.stTextInput::after {
-            content: "";
+        /* Magnifying glass icon */
+        .stTextInput {
+            position: relative !important;
+        }
+        .stTextInput::before {
+            content: "🔍";
             position: absolute;
-            left: 22px;
-            top: 60%;
-            transform: rotate(45deg);
-            width: 2px;
-            height: 7px;
-            background-color: #939395;
-            z-index: 100;
+            left: 15px;
+            top: 11px;
+            font-size: 15px;
+            z-index: 10;
+            color: #777;
         }
         </style>
         """, unsafe_allow_html=True)
